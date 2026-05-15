@@ -1,21 +1,62 @@
+from django.core.management.base import BaseCommand
 import pandas as pd
-import os
 import requests
-import json
+import time
+import re
+from biblioteca.models import Livro
+from django.db.models import Q
 
-ler = pd.read_excel("Livros.xls")
-#crie uma variavel com a key da api#
+class Command(BaseCommand):
+    help = "Atualiza apenas a sinopse dos livros existentes"
 
-for titulo, autor in zip(ler["Unnamed: 1"].iloc[3:100], ler["Unnamed: 2"].iloc[3:100]):
-    params = {
-        "q": f"sinopse do livro {titulo} de {autor}","api_key": #coloque a variavel aqui#
-   }
-    resposta = requests.get("https://serpapi.com/search", params=params)
-    resposta.raise_for_status()
-    dados = resposta.json()
-    try:
-        sinopse = dados['related_questions'][0].get('snippet')
-        print(sinopse)
-    except:
-        print("Sinopse não encontrada")
-print(json.dumps(sinopse, indent=2))
+    def handle(self, *args, **options):
+        df = pd.read_excel("biblioteca/management/commands/Livros.xls", header=3)
+        url = "https://www.googleapis.com/books/v1/volumes"
+        API_KEY = "AIzaSyB3pCR8ZU9agPrlllVt0t8eoxgC6NyXuXY"
+
+        for titulo, autor in zip(df["TÍTULO"], df["AUTOR(A)"]):
+            if pd.isna(titulo): continue
+
+            titulo_limpo = re.split(r'\d+ª?\s*Ed|\s+\d+Ed|/', str(titulo))[0].strip()
+            autor_str = str(autor).strip() if not pd.isna(autor) else ""
+
+            livros_no_banco = Livro.objects.filter(
+                Q(titulo__icontains=titulo_limpo) & Q(autor=autor_str) &
+                (Q(sinopse__isnull=True) | Q(sinopse="") | Q(sinopse="Sinopse não disponível."))
+            )
+
+            if not livros_no_banco.exists():
+                self.stdout.write(f"Pulando: {titulo} (Já tem sinopse ou não está no banco)")
+                continue
+
+            titulo_busca = titulo_limpo
+            params = {"q": f'intitle:{titulo_busca}+inauthor:{autor_str}', "maxResults": 1, "key": API_KEY}
+
+            try:
+                response = requests.get(url, params=params, timeout=10)
+
+                if response.status_code == 429:
+                    self.stdout.write(self.style.WARNING("Cota da API esgotada (429). Encerrando..."))
+                    break
+
+                if response.status_code == 503:
+                    self.stdout.write(f"Aguardando API (503)...")
+                    time.sleep(30)
+                    response = requests.get(url, params=params, timeout=10)
+
+                response.raise_for_status()
+                dados = response.json()
+
+                if dados.get("items"):
+                    sinopse = dados["items"][0]["volumeInfo"].get("description", "Sinopse não disponível.")
+                    livros_no_banco.update(sinopse=sinopse)
+                    self.stdout.write(self.style.SUCCESS(f"Sinopse adicionada: {titulo}"))
+                else:
+                    livros_no_banco.update(sinopse="Sinopse não disponível.")
+                    self.stdout.write(f"Não encontrado na API: {titulo}")
+
+                time.sleep(1.5)
+
+            except Exception as e:
+                self.stdout.write(self.style.ERROR(f"Erro em {titulo}: {e}"))
+                time.sleep(5)
